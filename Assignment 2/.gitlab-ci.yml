@@ -1,0 +1,192 @@
+image: gcc                    # the default docker image for all jobs is gcc, which contains useful tools for compiling C++ project.
+                              # tools used in this pipeline contained in the gcc image are make and g++.
+
+variables:
+  LINUX_EXE_NAME:           "myProg.out"
+  TEST_EXE_NAME:            "test.out"
+  GENERIC_PACKAGE_REPO_URL: "https://gitlab.com/api/v4/projects/$CI_PROJECT_ID/packages/generic/$CI_PROJECT_NAME/bin/$CI_COMMIT_SHORT_SHA/$LINUX_EXE_NAME.zip"
+
+stages:
+  - build                     # compile final application and test application in parallel, usign two jobs.
+  - verify                    # perform linting and mem-checking in parallel, using two jobs.
+  - test                      # execute the test application to check if all tests pass.
+  - package                   # tag the repo using a robot account.
+  - release                   # create a docker image containing the final application and ship it to the container registry.
+  - docs                      # generate documentation and publish it to gitlab pages.
+  - deploy                    # optional, not implemented.
+
+workflow:                     # use to control the execution flow of the pipeline.
+  rules:
+    - if: $CI_COMMIT_TAG      # if the pipeline is triggered by a tag of the repo, usually performed with a release, then the pipeline is not executed.
+      when: never
+    - when: always            # always execute the pipeline in all other cases.
+
+# compile the final application to be shipped.
+compile-linux:
+  stage: build
+  script:
+    - make                    # use the make tool for compiling and linking of the source files.
+                              # when no rule name is specified, make uses the first rule contained in the makefile.
+  artifacts:
+    paths:
+      - bin/$LINUX_EXE_NAME   # save the executable as an artifact, for later use in next jobs.
+    expire_in: 15 minutes     # the final application executable is available for download only for 15 minutes.
+
+
+
+# compile the test application.
+compile-test:
+  stage: build
+  before_script:
+    - apt-get update && apt-get -y install cmake                    		# install cmake.
+    - bash scripts/install_gtest.sh && bash scripts/install_gbenchmark.sh	# install both gtest and google benchmark using two bash scripts.
+  script:
+    - make -B $TEST_EXE_NAME                                        		# compile the test application using the correct rule in the makefile associated to the project.
+  artifacts:
+    paths:
+      - bin/$TEST_EXE_NAME                                          		# save the executable as an artifact, for later use in other jobs.
+    expire_in: 15 minutes                                           		# the test application executable is available for download only for 15 minutes.
+  dependencies: []                                                  		# this job does not use any artifacts produced by previous jobs.
+
+
+
+# lint the code in the source files.
+lint:
+  stage: verify
+  image: python:slim                                      	# cpplint is a python package and, therefore, need a docker image containing both python and pip.
+  before_script:
+    - pip install cpplint                                 	# install cpplint using pip packet manager.
+  script:                                                   # lint all files contained in the source dir. some errors are suppressed because useful in real-world scenario,   	
+                                                            # but not in this simple application (example: missing copyright notice at the start of each file).
+    - cpplint --quiet --filter=-legal/copyright --linelength=200 --recursive src/
+  allow_failure: true                                     	# linting is a "stylistic" analysis of the code and does not verify code correctness. therefore the job can fail.              
+  dependencies: []                                        	# this job does not use any artifact produced by previous jobs. 
+
+
+
+# analyse memory usage to try to find memory errors, like memory leaks. 
+# mem-checking is performed on the test application to simulate interaction with the application
+# and to change the application's state, useful for finding more bugs.
+mem-check:
+  stage: verify
+  before_script:
+    - apt-get update && apt-get -y install valgrind                             # install the valgrind tool
+  script:
+    - valgrind ./bin/$TEST_EXE_NAME --gtest_filter=*  --benchmark_filter=BM_NO  # execute the valgrind tool on the test application. unit tests are used to simulate user interactions.
+  dependencies:
+    - compile-test                                                              # this job uses the test application artifact produced in the build stage, and therefore depends on the compile-test job.
+
+
+
+# execute unit tests.
+unit-test:
+  stage: test
+  script:
+    - ./bin/$TEST_EXE_NAME --gtest_filter=*  --benchmark_filter=BM_NO   # execute the test application. only tests are executed, no benchmarks.
+  dependencies:
+    - compile-test                                                      # this job uses the test application artifact produced in the build stage, and therefore depends on the compile-test job.
+
+
+
+# execute performance tests.
+benchmarks:  
+  stage: test
+  only:
+    - dev                                                       	      # performance tests are resource-intensive, therefore they are executed only when new code is published 
+    - main                                                      	      # to dev and main branches, not at every commits on feature branches.
+  needs:
+    - unit-test                                                 	      # performance tests are resource-intensive, therefore are executed only if all unit tests pass.
+    - compile-test
+  script:
+    - ./bin/$TEST_EXE_NAME --gtest_filter=  --benchmark_filter=BM_*     # execute the test application. only benchmarks are executed, no tests.
+  dependencies:
+    - compile-test                                              	      # this job uses the test application produced by the compile-test job of the build stage. therefore, it depends on it.
+
+
+
+# zip the executables in preparation for their future release.
+# this pipeline is kept simple, and the program build only for a single target platform, linux x64. 
+# it's easy to expand the pipeline to compile for other architectures.
+zip:
+  stage: package
+  only:
+    - main                                            	# zipping in preparation for a release should be performed only when new code is published to the main branch.
+  image: dockerinpractice/docker-dev-tools-image      	# the zip job needs the zip tool. this image contains zip.
+  script:
+    - zip bin/$LINUX_EXE_NAME.zip bin/$LINUX_EXE_NAME   # zip the executable previously compiled and linked.
+  artifacts:
+    paths:
+      - bin/$LINUX_EXE_NAME.zip                       	# save the compressed executable for future shipping in next jobs.
+    expire_in: 15 minutes                             	# the artifacts require memory and, therefore, should not be kept forever. it expires in 15 minutes.
+                                                        # it will still be accessible, thanks to making it persistent in next jobs.
+  dependencies:
+    - compile-linux                                   	# the job needs the executable previously compiled to compress it. therefore, it depends on the compile-linux job.
+
+
+
+# save the compressed executable in the generic package repo, to make it available for download.
+persist:
+  stage: release
+  only:
+    - main                                            # the compressed executable should be made persistant only when new code is published to the main branch.
+  image: curlimages/curl                              # pushing a file to the generic package repo requires the curl tool. this docker image contains it.
+  script:
+                                                      # push the compressed executable to the generic package repo. a token with api access is required for manipulating the generic package repo.
+    - 'curl --location --header "PRIVATE-TOKEN: $PERSONAL_API_TOKEN" --upload-file bin/$LINUX_EXE_NAME.zip "$GENERIC_PACKAGE_REPO_URL"'
+  dependencies:
+    - zip                                             # the compressed executable to be pushed to the generic package repo is produced by the zip job. therefore, this job depends on it.
+
+
+
+# create a docker image containing the final application executable, using rules in the Dockerfile.
+docker-image:
+  stage: release
+  only:
+    - main                                                            # the docker image is created and published only when new code is published to the main repo.
+                                                                      # it should be performed only at new releases, not at every commit on other branches.
+  image: docker:stable                                                # creation of the docker image needs docker and its dind service. this image contains both of them.
+  services:
+    - docker:dind
+  script: 
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY   # log in the container registry.
+    - docker build -t $CI_REGISTRY_IMAGE .                            # build the docker image using the rules of the Dockerfile.
+    - docker push $CI_REGISTRY_IMAGE                                  # push the new docker image to the repo's container registry. 
+  dependencies:
+    - compile-linux                                                   # this job construct the docker image using the final application executable, produced in the build stage.
+
+
+
+# create a new release and link it to the compressed executable previously uploaded to the generic package repo.
+release:
+  stage: release
+  only:
+    - main                                                        # a new release should be created only when new code is published to the main branch.
+  image: registry.gitlab.com/gitlab-org/release-cli:latest  
+  script:
+    - echo 'null'                                                 # a job requires a script or run section. the release job only has to push the compressed exe to the generic package repo, without executing a command.
+                                                                  # this echo command is basically a "placeholder" to fill the script section.
+  release:                                                        # this section is used by gitlab to define a new release.
+    name: 'Release $CI_COMMIT_SHORT_SHA'
+    description: 'Release $CI_COMMIT_SHORT_SHA'
+    tag_name: '$CI_COMMIT_SHORT_SHA'                              # tag the repo with a new tag which name is the commit's short id. the release will be linked to this tag.
+    assets:                                                       # assets are all resources included in a release, other than the source code.
+      links:                                                      
+        - name: '$LINUX_EXE_NAME.zip' 
+          url: "$GENERIC_PACKAGE_REPO_URL"                        # link to the compressed executable contained in the generic package repo.
+
+
+
+# generate documentation from comments in the source files using doxygen, and then publish it to gitlab pages.
+pages:                                        # the job has to be named "pages", otherwise gitlab does not automatically publish the content of the public/ folder.
+  stage: docs
+  only:
+    - main                                    # the job is executed only when new code is published to the main branch, because new docs is published only at new releases.
+  before_script:
+    - apt update && apt -y install doxygen    # install the valgrind tool.
+  script:
+    - doxygen Doxyfile                        # generate the docs following the rules in the Doxyfile. Doxyfile specifies the working dir containing the source files.
+    - mv html/ public/                        # moved the produced docs to the public folder.
+  artifacts:
+    paths:
+      - public                                # save the docs as an artifact, to be published to the repo's gitlab pages.
+  dependencies: []                            # the job does not use any artifact produced by previous job.
